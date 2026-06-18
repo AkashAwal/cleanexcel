@@ -20,6 +20,10 @@ REJECTED_CSV    = "rejected_no_image.csv"
 CACHE_FILE      = "isbn_cache.json"
 PROGRESS_FILE   = "progress.json"
 
+# Split accepted output into chunks of this many rows (Shopify recommends ≤5000).
+# Set to 0 to disable chunking (single file).
+CHUNK_SIZE      = 2000
+
 REJECTED_HEADERS = [
     "ISBN", "Original Title", "Author", "Publisher",
     "Binding", "Language", "Price", "Stock", "Reason"
@@ -228,13 +232,12 @@ def best_image_url(base_google_url: str, isbn: str) -> str:
     return ""
 
 
-def build_shopify_row(isbn: str, excel: dict, api: dict) -> dict:
+def build_shopify_row(isbn: str, excel: dict, api: dict, verified_image: str = "") -> dict:
     title        = clean_text(api.get("title")        or excel["name"])
     authors      = clean_text(api.get("authors")      or excel["AUTHOR1"])
     publisher    = clean_text(api.get("publisher")    or excel["PUBLISHER"])
     desc         = clean_text(api.get("description",  ""))
-    raw_image    = api.get("image", "")
-    image        = best_image_url(raw_image, isbn) if raw_image else open_library_cover_url(isbn)
+    image        = verified_image
     categories   = api.get("categories", [])
     page_count   = api.get("page_count", "")
     pub_date     = api.get("published_date", "")
@@ -328,6 +331,12 @@ def save_progress(row_index: int):
         json.dump({"last_row": row_index}, f)
 
 
+def _chunk_path(n: int) -> str:
+    """Return output path for chunk n (1-based). Uses single file when chunking off."""
+    base = Path(OUTPUT_CSV)
+    return str(base.with_stem(f"{base.stem}_{n:03d}"))
+
+
 def main():
     # Load persisted cache
     cache: dict = {}
@@ -340,27 +349,58 @@ def main():
     start_row = 0
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, "r") as f:
-            start_row = json.load(f).get("last_row", 0)
+            prog = json.load(f)
+            start_row = prog.get("last_row", 0)
         print(f"Resuming from row {start_row}.")
 
     wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True, data_only=True)
     ws = wb["Sheet1"]
-    rows = list(ws.iter_rows(min_row=2, values_only=True))  # skip header row
+    rows = list(ws.iter_rows(min_row=2, values_only=True))
     total = len(rows)
     print(f"Total book rows: {total}")
+    if CHUNK_SIZE:
+        print(f"Chunking output every {CHUNK_SIZE} accepted rows.")
 
-    mode = "a" if start_row > 0 else "w"
-    with open(OUTPUT_CSV, mode, newline="", encoding="utf-8-sig") as main_f, \
-         open(REJECTED_CSV, mode, newline="", encoding="utf-8-sig") as rej_f:
+    chunking = CHUNK_SIZE > 0
+    accepted = rejected = 0
+    chunk_num = 1
+    rows_in_chunk = 0
 
-        writer  = csv.DictWriter(main_f, fieldnames=SHOPIFY_HEADERS)
-        rej_writer = csv.DictWriter(rej_f, fieldnames=REJECTED_HEADERS)
-        if start_row == 0:
-            writer.writeheader()
-            rej_writer.writeheader()
+    def _open_chunk(n: int, append: bool):
+        path = _chunk_path(n) if chunking else OUTPUT_CSV
+        mode = "a" if append else "w"
+        f = open(path, mode, newline="", encoding="utf-8-sig")
+        w = csv.DictWriter(f, fieldnames=SHOPIFY_HEADERS)
+        if not append:
+            w.writeheader()
+        return f, w
 
-        accepted = rejected = 0
+    def _count_csv_rows(path: str) -> int:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                return sum(1 for _ in f) - 1  # subtract header
+        except FileNotFoundError:
+            return 0
 
+    # When resuming, append to the last chunk; otherwise start fresh.
+    resuming = start_row > 0
+    if resuming and chunking:
+        existing = sorted(Path(".").glob(_chunk_path(0).replace("000", "*").lstrip("./")))
+        chunk_num = max(len(existing), 1)
+        rows_in_chunk = _count_csv_rows(str(existing[-1])) if existing else 0
+
+    main_f, writer = _open_chunk(chunk_num, append=resuming)
+
+    rej_mode = "a" if resuming else "w"
+    rej_f = open(REJECTED_CSV, rej_mode, newline="", encoding="utf-8-sig")
+    rej_writer = csv.DictWriter(rej_f, fieldnames=REJECTED_HEADERS)
+    if not resuming:
+        rej_writer.writeheader()
+
+    chunk_paths = [_chunk_path(chunk_num) if chunking else OUTPUT_CSV]
+    last_completed_row = start_row
+
+    try:
         for i, row in enumerate(rows):
             if i < start_row:
                 continue
@@ -389,37 +429,62 @@ def main():
             else:
                 api_data = cache[isbn]
 
-            shopify_row = build_shopify_row(isbn, excel, api_data)
+            # Verify image once and persist result so subsequent runs skip HTTP checks
+            if "verified_image" not in api_data:
+                raw = api_data.get("image", "")
+                api_data["verified_image"] = best_image_url(raw, isbn) if raw else open_library_cover_url(isbn)
+                cache[isbn] = api_data
+
+            shopify_row = build_shopify_row(isbn, excel, api_data, verified_image=api_data["verified_image"])
 
             if shopify_row["Image Src"]:
+                # Roll over to a new chunk if needed
+                if chunking and rows_in_chunk >= CHUNK_SIZE:
+                    main_f.close()
+                    chunk_num += 1
+                    rows_in_chunk = 0
+                    main_f, writer = _open_chunk(chunk_num, append=False)
+                    chunk_paths.append(_chunk_path(chunk_num))
+
                 writer.writerow(shopify_row)
                 accepted += 1
+                rows_in_chunk += 1
             else:
                 rej_writer.writerow({
-                    "ISBN":          isbn,
+                    "ISBN":           isbn,
                     "Original Title": clean_text(name or ""),
-                    "Author":        clean_text(author or ""),
-                    "Publisher":     clean_text(publisher or ""),
-                    "Binding":       clean_text(binding or ""),
-                    "Language":      clean_text(language or ""),
-                    "Price":         str(price or ""),
-                    "Stock":         str(int(stock)) if stock else "0",
-                    "Reason":        "No verified image found (Google Books + Open Library both failed)",
+                    "Author":         clean_text(author or ""),
+                    "Publisher":      clean_text(publisher or ""),
+                    "Binding":        clean_text(binding or ""),
+                    "Language":       clean_text(language or ""),
+                    "Price":          str(price or ""),
+                    "Stock":          str(int(stock)) if stock else "0",
+                    "Reason":         "No verified image found (Google Books + Open Library both failed)",
                 })
                 rejected += 1
 
-            # Checkpoint every 200 rows
-            if (i + 1) % 200 == 0:
-                save_cache(cache)
-                save_progress(i + 1)
-                pct = (i + 1) / total * 100
-                print(f"  {i+1}/{total} ({pct:.1f}%)  accepted={accepted}  rejected={rejected}")
+            last_completed_row = i + 1
 
+            # Checkpoint every 200 rows
+            if last_completed_row % 200 == 0:
+                save_cache(cache)
+                save_progress(last_completed_row)
+                pct = last_completed_row / total * 100
+                print(f"  {last_completed_row}/{total} ({pct:.1f}%)  accepted={accepted}  rejected={rejected}")
+
+    finally:
+        main_f.close()
+        rej_f.close()
         save_cache(cache)
-        save_progress(total)
+        save_progress(last_completed_row)  # saves actual position, not total, on crash/interrupt
 
     print(f"\nDone!")
-    print(f"  ✅ Imported:  {accepted} books → {OUTPUT_CSV}")
+    if chunking:
+        print(f"  ✅ Imported:  {accepted} books → {len(chunk_paths)} chunk(s):")
+        for p in chunk_paths:
+            print(f"       {p}")
+    else:
+        print(f"  ✅ Imported:  {accepted} books → {OUTPUT_CSV}")
     print(f"  ❌ Rejected:  {rejected} books → {REJECTED_CSV} (no verified image)")
     hits = sum(1 for v in cache.values() if v.get("title"))
     print(f"  API hits: {hits} / {len(cache)}")
