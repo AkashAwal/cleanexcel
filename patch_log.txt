@@ -1,0 +1,7 @@
+Found 38 CSV file(s), processing in order.
+
+52026 ISBNs missing descriptions
+45225 ISBNs missing real cover images
+
+[Phase 1] OL Works API for 52026 missing descriptions...
+  OL Works: 200/52026  filled=0
