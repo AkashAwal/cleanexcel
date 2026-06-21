@@ -47,10 +47,12 @@ def _has_description(body_html: str) -> bool:
 
 
 def _has_real_image(img_src: str) -> bool:
-    """Real image = any non-empty URL that isn't the OL black fallback."""
+    """Real image = any non-empty URL that isn't an OL placeholder/fallback."""
     if not img_src:
         return False
     if "covers.openlibrary.org/b/isbn/" in img_src:
+        return False
+    if "covers.openlibrary.org/b/id/-1-" in img_src:
         return False
     return True
 
