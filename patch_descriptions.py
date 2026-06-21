@@ -26,8 +26,9 @@ from rich.rule import Rule
 console = Console(force_terminal=True, highlight=False)
 
 # ── CLI flags ──────────────────────────────────────────────────────────────────
-USE_CLAUDE = "--claude" in sys.argv
-ISBNDB_KEY = next(
+USE_CLAUDE   = "--claude" in sys.argv
+REWRITE_ONLY = "--rewrite-only" in sys.argv
+ISBNDB_KEY   = next(
     (sys.argv[i+1] for i, a in enumerate(sys.argv)
      if a == "--isbndb" and i+1 < len(sys.argv)), None
 )
@@ -135,21 +136,31 @@ def main():
                 if not _has_real_image(row.get("Image Src", "")):
                     needs_image.append(isbn)
 
-    needs_desc  = list(dict.fromkeys(needs_desc))
-    needs_image = list(dict.fromkeys(needs_image))
-    all_targets = list(dict.fromkeys(needs_image + needs_desc))
+    needs_desc  = set(dict.fromkeys(needs_desc))
+    needs_image = set(dict.fromkeys(needs_image))
+    all_targets = list(dict.fromkeys(list(needs_image) + list(needs_desc)))
 
     console.print(Rule())
     console.print(f"[bold yellow]{len(needs_desc)}[/bold yellow] ISBNs missing descriptions")
     console.print(f"[bold yellow]{len(needs_image)}[/bold yellow] ISBNs missing real cover images")
-    console.print(f"[bold yellow]{len(all_targets)}[/bold yellow] unique ISBNs to fix total")
+    console.print(f"[bold yellow]{len(all_targets)}[/bold yellow] unique ISBNs to process")
+
+    # How many are already satisfied by cache from previous runs
+    already_done = sum(
+        1 for isbn in all_targets
+        if (isbn not in needs_image or _has_real_image(cache.get(isbn, {}).get("image", "")))
+        and (isbn not in needs_desc  or cache.get(isbn, {}).get("description"))
+    )
+    console.print(f"[dim]{already_done} already fixed in cache (will skip) → {len(all_targets)-already_done} real API calls needed[/dim]")
 
     def _save_cache():
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False)
 
-    # ── Phase 1: ISBNdb bulk ──────────────────────────────────────────────────
-    if ISBNDB_KEY:
+    # ── Phase 1: ISBNdb ───────────────────────────────────────────────────────
+    if REWRITE_ONLY:
+        console.print(Rule("[bold yellow]--rewrite-only: skipping all API calls[/bold yellow]"))
+    elif ISBNDB_KEY:
         console.print(Rule("[bold]Phase 1: ISBNdb (1 call/sec)[/bold]"))
         console.print(f"[dim]{len(all_targets)} ISBNs @ 5000/day limit[/dim]\n")
 
@@ -170,6 +181,14 @@ def main():
             task = prog.add_task("ISBNdb", total=len(all_targets), stats="img=0 desc=0")
 
             for idx, isbn in enumerate(all_targets, 1):
+                # Skip if cache already satisfies what this ISBN needed
+                entry = cache.get(isbn, {})
+                still_needs_img  = (isbn in needs_image) and not _has_real_image(entry.get("image", ""))
+                still_needs_desc = (isbn in needs_desc)  and not entry.get("description")
+                if not still_needs_img and not still_needs_desc:
+                    prog.update(task, advance=1, stats=f"img={got_img} desc={got_desc}")
+                    continue
+
                 book  = _fetch_isbndb(isbn, ISBNDB_KEY)
 
                 if book.get("_429"):
@@ -219,7 +238,7 @@ def main():
         console.print(Rule("[dim]Phase 1: ISBNdb skipped (no --isbndb key)[/dim]"))
 
     # ── Phase 2: Claude (optional) ────────────────────────────────────────────
-    if USE_CLAUDE:
+    if USE_CLAUDE and not REWRITE_ONLY:
         claude_targets = [i for i in needs_desc if not cache.get(i, {}).get("description")]
         console.print(Rule("Phase 2: Claude Haiku (descriptions only)"))
         console.print(f"[dim]{len(claude_targets)} still missing descriptions[/dim]\n")
