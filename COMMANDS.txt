@@ -1,0 +1,288 @@
+========================================================
+  CLEANEXCEL - COMMAND REFERENCE & NOTES
+  Project: Distributor Excel -> Shopify-ready CSVs
+  Output:  shopify_import_001.csv ... shopify_import_038.csv
+           (2,000 books per CSV file)
+========================================================
+
+
+================================================================
+  STARTING FRESH WITH A NEW EXCEL FILE
+  Read this entire section before touching anything else.
+================================================================
+
+  STEP A — PREPARE THE EXCEL FILE
+  --------------------------------
+  The Excel file MUST be formatted exactly like this:
+    - Sheet name must be:  Sheet1   (exactly, capital S)
+    - No header row skip needed — row 1 is skipped automatically
+    - Must have exactly 10 columns in this order:
+
+      Col A  |  ISBN
+      Col B  |  Book Title / Name
+      Col C  |  Author
+      Col D  |  Publisher
+      Col E  |  Binding Type  (e.g. Paperback, Hardcover)
+      Col F  |  Language
+      Col G  |  (any column — ignored by the script)
+      Col H  |  Price  (number)
+      Col I  |  Stock / Quantity  (number)
+      Col J  |  (any column — ignored by the script)
+
+  If the columns are in a different order in the new file,
+  you MUST update enrich_books.py (see Step B below).
+
+
+  STEP B — UPDATE THE FILENAME IN enrich_books.py
+  -------------------------------------------------
+  Open:  enrich_books.py
+  Find line 20 (near the top, under "# ── Config"):
+
+      EXCEL_FILE = "common distributor stock IBD PBI 10.06.2026.xlsx"
+
+  Change the filename to match your new Excel file exactly:
+
+      EXCEL_FILE = "your new excel file name here.xlsx"
+
+  The Excel file must be in the SAME folder as the scripts.
+
+  Optional — also change CHUNK_SIZE on line 27 if needed:
+      CHUNK_SIZE = 2000   <- 2000 books per output CSV (recommended)
+                             0 = put everything in one file
+
+
+  STEP C — CLEAR OLD RUN STATE
+  -----------------------------
+  Before running on a new Excel, delete or rename these files
+  so the script starts fresh:
+
+      Delete:  progress.json            (tracks last processed row)
+      Delete:  shopify_import_*.csv     (old output files)
+      Delete:  rejected_no_image.csv    (old rejected books log)
+
+  KEEP (optional but recommended):
+      Keep:    isbn_cache.json          (56,000+ already-looked-up ISBNs)
+                                         Keeping it saves API calls for
+                                         books that appeared in old run.
+
+  To delete the old CSVs quickly, open terminal in the project
+  folder and run:
+      del shopify_import_*.csv
+      del rejected_no_image.csv
+      del progress.json
+
+  Then double-check nothing is left:
+      dir shopify_import_*.csv
+
+
+  STEP D — RUN THE MAIN SCRIPT
+  -----------------------------
+  Once Steps A, B, C are done:
+
+      py run.py
+
+  This will process your entire new Excel file from row 1.
+
+
+================================================================
+  CURRENT RUN (IBD PBI 10.06.2026.xlsx) — STATUS
+================================================================
+  Main run:   COMPLETE  (74,082 books processed)
+  CSV files:  shopify_import_001.csv through shopify_import_038.csv
+  CSV 001:    READY TO UPLOAD (2,000/2,000 images + descriptions)
+  Remaining:  CSVs 002–038 still being enriched via ISBNdb daily
+
+
+================================================================
+  DAILY COMMANDS (RUN EVERY DAY UNTIL ALL CSVS ARE DONE)
+================================================================
+
+  -- PATCH MISSING IMAGES & DESCRIPTIONS --
+
+    py patch_descriptions.py --isbndb YOUR_API_KEY
+
+  Current ISBNdb key:
+    py patch_descriptions.py --isbndb 69965_8e5d04434135b14a7c47ec6fbdb731be
+
+  What it does:
+    - Scans all CSVs for missing images or descriptions
+    - Calls ISBNdb API (1 call/sec, 5,000/day on free plan)
+    - Smart skip: already-filled books are skipped instantly
+    - Auto-saves cache every 100 books
+    - Rewrites all CSVs at end automatically
+    - Processes in order: 001 -> 002 -> ... -> 038
+
+  Stops automatically at the 5,000/day limit.
+  Run again next day — picks up exactly where it left off.
+
+  Optional flags:
+    --claude        Also generate descriptions using Claude AI
+    --rewrite-only  Just rewrite CSVs from cache, no API calls
+
+
+================================================================
+  BEFORE UPLOADING TO SHOPIFY — VERIFY IMAGES
+================================================================
+
+    py verify_images.py shopify_import_001.csv
+
+  Run this on any CSV before uploading to Shopify.
+  It checks every image URL is real (live HTTP check).
+
+  Result codes:
+    OK    = real image confirmed (HTTP 200, correct type, size > 2KB)
+    FAIL  = bad URL / wrong HTTP status — needs fixing
+    TINY  = file under 2KB — likely a placeholder image
+    ERR   = connection timeout — retry or replace manually
+    WARN  = no Content-Type header — usually still fine
+
+  Run on any file by changing the filename:
+    py verify_images.py shopify_import_002.csv
+    py verify_images.py shopify_import_003.csv
+
+  Target: 0 FAIL, 0 TINY, 0 ERR before uploading.
+
+
+================================================================
+  CHECK A CSV's STATS (images + descriptions coverage)
+================================================================
+
+  Paste this into terminal (change the filename on line 5):
+
+    py -c "
+    import csv, re
+    CSV = 'shopify_import_001.csv'
+    def ri(u): return bool(u) and 'covers.openlibrary.org/b/isbn/' not in u and 'covers.openlibrary.org/b/id/-1-' not in u
+    def rd(h): return bool(re.search(r'<p>.+?</p>', h, re.DOTALL))
+    t=ri_=rd_=b=n=ni=0
+    with open(CSV, encoding='utf-8-sig') as f:
+      for row in csv.DictReader(f):
+        if not row.get('Variant SKU','').strip(): continue
+        t+=1; i=ri(row.get('Image Src','')); d=rd(row.get('Body (HTML)',''))
+        if i: ri_+=1
+        if d: rd_+=1
+        if i and d: b+=1
+        if not i and not d: n+=1
+        if not i: ni+=1
+    print('Total:',t,'| Images:',ri_,'| Desc:',rd_,'| Both:',b,'| Neither:',n,'| No image:',ni)
+    "
+
+
+================================================================
+  UPLOADING TO SHOPIFY
+================================================================
+
+  Upload CSVs in order: 001 first, then 002, 003, etc.
+  Always verify images first (see above).
+
+  In Shopify admin:
+    Products -> Import -> Upload file -> shopify_import_001.csv
+    (tick "Overwrite existing products" only if re-uploading)
+
+  Do NOT upload all 38 at once — do a few, check they look right
+  in the store, then continue.
+
+
+================================================================
+  ISBNDB PLAN INFO
+================================================================
+
+  Free trial   : 5,000 calls/day for 7 days
+  Basic plan   : $14.99/month (upgrade when client pays)
+
+  Daily math:
+    5,000 calls/day x remaining days = books that get filled
+    ~25,000+ books across CSVs 002-038 still need enriching
+    Upgrade to paid plan for faster completion
+
+  IMPORTANT: Cancel free trial before 7 days expire if not
+  upgrading, to avoid $14.99 charge.
+
+  When you upgrade — same exact command, just higher daily limit.
+
+
+================================================================
+  KEY FILES — WHAT EACH ONE DOES
+================================================================
+
+  enrich_books.py           Core book logic. Edit EXCEL_FILE here
+                            when switching to a new Excel file.
+  run.py                    Main script. Reads Excel, calls OL API,
+                            writes shopify_import_*.csv files.
+  patch_descriptions.py     Daily patch script. Fills missing images
+                            and descriptions via ISBNdb.
+  verify_images.py          Checks all image URLs are real and live.
+  isbn_cache.json           Cache of 56,512+ ISBNs already looked up.
+                            Keeps growing. Don't delete between runs.
+  isbn_cache_pre_patch.json Backup of cache before patching started.
+  progress.json             Tracks last row processed by run.py.
+                            Delete this when starting a new Excel.
+  rejected_no_image.csv     Books that failed enrichment. Review these.
+  shopify_import_001.csv    First 2,000 books — READY TO UPLOAD.
+  shopify_import_002.csv    Next 2,000 books, and so on up to 038.
+
+
+================================================================
+  TYPICAL DAILY WORKFLOW
+================================================================
+
+  1. Open terminal in:
+       C:\Users\Akash Awal\Documents\GitHub\cleanexcel
+
+  2. Run daily patch:
+       py patch_descriptions.py --isbndb 69965_8e5d04434135b14a7c47ec6fbdb731be
+
+  3. Script hits daily limit (429) and stops automatically.
+
+  4. Before uploading any CSV, verify images:
+       py verify_images.py shopify_import_00X.csv
+
+  5. Upload verified CSVs to Shopify (Products -> Import).
+
+  6. Repeat steps 2-5 next day.
+
+
+================================================================
+  TROUBLESHOOTING
+================================================================
+
+  Script seems frozen on one book:
+    Press Ctrl+C and re-run. It resumes from last saved row.
+    progress.json tracks the exact row it was on.
+
+  All crosses (x) shown in terminal:
+    Normal — crosses mean ISBNdb had no data for that book.
+    Green OK = found image or description.
+    The daily limit hasn't been wasted — crosses just skip fast.
+
+  "0 patches" after --rewrite-only:
+    Expected. CSVs were already updated during the last run.
+    Rewrite runs automatically when daily limit is hit.
+
+  429 rate limit hit too early:
+    You've used all 5,000 daily calls. Wait until tomorrow,
+    or upgrade to a paid ISBNdb plan.
+
+  Image shows FAIL in verify_images.py:
+    The URL is broken. Find a replacement on Goodreads:
+      https://www.goodreads.com/book/isbn/XXXXXXXXXX
+    Then manually update isbn_cache.json for that ISBN
+    and run:  py patch_descriptions.py --rewrite-only
+
+  verify_images.py shows TINY (< 2KB):
+    Likely a placeholder. Treat same as FAIL — find a
+    real image from Goodreads and patch it.
+
+  New Excel has different column order:
+    Open enrich_books.py, find line ~133 in run.py:
+      (_, name, author, publisher, binding, language,
+       _, price, stock, _) = row
+    Reorder the variable names to match your column order.
+    Also update EXCEL_FILE in enrich_books.py (line 20).
+
+  "Sheet1 not found" error on run.py:
+    Your Excel sheet tab is named something else.
+    Open enrich_books.py, find:  wb["Sheet1"]
+    Change "Sheet1" to whatever your sheet tab is named.
+
+========================================================
